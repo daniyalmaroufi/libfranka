@@ -103,9 +103,12 @@ template <typename T>
 bool Network::udpReceive(T* data) {
   std::lock_guard<std::mutex> _(udp_mutex_);
 
-  if (udp_socket_.available() >= static_cast<int>(sizeof(T))) {
-    *data = udpBlockingReceiveUnsafe<T>();
-    return true;
+  // Check available data with a small poll to avoid busy-waiting
+  if (udp_socket_.poll(0, Poco::Net::Socket::SELECT_READ)) {
+    if (udp_socket_.available() >= static_cast<int>(sizeof(T))) {
+      *data = udpBlockingReceiveUnsafe<T>();
+      return true;
+    }
   }
   return false;
 }
@@ -120,14 +123,18 @@ template <typename T>
 T Network::udpBlockingReceiveUnsafe() try {
   std::array<uint8_t, sizeof(T)> buffer;
 
-  int bytes_received =
-      udp_socket_.receiveFrom(buffer.data(), static_cast<int>(buffer.size()), udp_server_address_);
+  // Receive from any source (address will be populated by receiveFrom)
+  // On first call, udp_server_address_ is empty and will be set by receiveFrom
+  int bytes_received = udp_socket_.receiveFrom(
+      buffer.data(), static_cast<int>(buffer.size()), udp_server_address_);
 
   if (bytes_received != static_cast<int>(buffer.size())) {
     throw ProtocolException("libfranka: incorrect object size");
   }
 
   return *reinterpret_cast<T*>(buffer.data());
+} catch (const Poco::TimeoutException&) {
+  throw NetworkException("libfranka: UDP receive: Timeout");
 } catch (const Poco::Exception& e) {
   using namespace std::string_literals;  // NOLINT(google-build-using-namespace)
   throw NetworkException("libfranka: UDP receive: "s + e.what());

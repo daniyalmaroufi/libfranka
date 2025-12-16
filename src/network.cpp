@@ -33,8 +33,28 @@ Network::Network(const std::string& franka_address,
       }
     }
 
+    // Configure UDP socket for high-rate traffic reception BEFORE binding
+    // This is critical for modern kernels - options must be set before bind()
+    try {
+      // Increase UDP receive buffer size for high-rate traffic (must be before bind)
+      int recv_buf_size = 8 * 1024 * 1024;  // 8MB for RT kernel traffic bursts
+      udp_socket_.setOption(SOL_SOCKET, SO_RCVBUF, recv_buf_size);
+      
+      // Enable address/port reuse
+      udp_socket_.setReuseAddress(true);
+      
+      // Reduce receive latency on RT systems
+      #ifdef SOL_SOCKET
+      int priority = 6;  // High priority for real-time traffic
+      udp_socket_.setOption(SOL_SOCKET, SO_PRIORITY, priority);
+      #endif
+    } catch (...) {
+      // Socket options are best-effort; continue if they fail
+    }
+
     udp_socket_.bind({"0.0.0.0", 0});
-    udp_socket_.setReceiveTimeout(Poco::Timespan{1000l * udp_timeout.count()});
+    // Increase UDP timeout for modern RT kernels - 5 seconds to be safe
+    udp_socket_.setReceiveTimeout(Poco::Timespan{5000000});  // 5 seconds in microseconds
     udp_port_ = udp_socket_.address().port();
   } catch (const Poco::Net::ConnectionRefusedException& e) {
     throw NetworkException(
