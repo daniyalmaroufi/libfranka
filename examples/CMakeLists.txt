@@ -37,6 +37,7 @@ set(EXAMPLES
   joint_impedance_control
   joint_point_to_point_motion
   motion_with_control
+  move_to_pose
   print_joint_poses
   vacuum_object
 )
