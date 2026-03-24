@@ -161,33 +161,48 @@ int main(int argc, char** argv) {
     std::cout << "  Position: [" << pos_x << ", " << pos_y << ", " << pos_z << "]" << std::endl;
     std::cout << "  Quaternion: [" << quat_x << ", " << quat_y << ", " << quat_z << ", " << quat_w << "]" << std::endl;
 
-    // Get movement duration from user
-    double movement_duration = 15.0;
-    std::cout << "\nEnter desired movement duration in seconds (default 15.0): ";
-    std::string duration_input;
-    std::cin.ignore();
-    std::getline(std::cin, duration_input);
-    if (!duration_input.empty()) {
+    // Calculate distance to target
+    double dx = pos_x - initial_state.O_T_EE_c[12];
+    double dy = pos_y - initial_state.O_T_EE_c[13];
+    double dz = pos_z - initial_state.O_T_EE_c[14];
+    double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+    std::cout << "Distance to target: " << distance * 1000.0 << " mm" << std::endl;
+
+    // Get Cartesian velocity from user (in mm/s)
+    double velocity_mm_s = 50.0;  // default 50 mm/s
+    std::cout << "\nEnter desired Cartesian velocity in mm/s (default 50.0): ";
+    std::string velocity_input;
+    std::getline(std::cin, velocity_input);
+    if (!velocity_input.empty()) {
       try {
-        movement_duration = std::stod(duration_input);
-        if (movement_duration <= 0) {
-          std::cerr << "Invalid duration, using default 15.0 seconds" << std::endl;
-          movement_duration = 15.0;
+        velocity_mm_s = std::stod(velocity_input);
+        if (velocity_mm_s <= 0) {
+          std::cerr << "Invalid velocity, using default 50.0 mm/s" << std::endl;
+          velocity_mm_s = 50.0;
         }
       } catch (const std::exception& e) {
-        std::cerr << "Invalid input, using default 15.0 seconds" << std::endl;
-        movement_duration = 15.0;
+        std::cerr << "Invalid input, using default 50.0 mm/s" << std::endl;
+        velocity_mm_s = 50.0;
       }
     }
-    std::cout << "Movement duration: " << movement_duration << " seconds" << std::endl;
+    std::cout << "Cartesian velocity: " << velocity_mm_s << " mm/s" << std::endl;
 
-    // Set default impedance and damping
+    // Calculate movement duration based on distance and velocity
+    double velocity_m_s = velocity_mm_s / 1000.0;  // convert to m/s
+    double calculated_duration = (distance > 1e-6) ? (distance / velocity_m_s) : 5.0;
+    // Add significant safety buffer (1.5x multiplier) to ensure smooth acceleration/deceleration
+    // The trapezoidal profile needs extra time to avoid velocity discontinuities
+    double movement_duration = calculated_duration * 1.5;
+    movement_duration = std::max(movement_duration, 8.0);  // Ensure at least 8 seconds
+    std::cout << "Calculated movement duration: " << movement_duration << " seconds" << std::endl;
+
+    // Set lower impedance for smoother motion
     try {
-      // Set Cartesian impedance (stiffness): {position stiffness: 1000 N/m, rotation stiffness: 100 Nm/rad}
-      robot.setCartesianImpedance({1000.0, 1000.0, 1000.0, 100.0, 100.0, 100.0});
+      // Set Cartesian impedance (stiffness): lower values for smoother, less jerky motion
+      robot.setCartesianImpedance({500.0, 500.0, 500.0, 50.0, 50.0, 50.0});
       
-      // Set joint impedance (stiffness)
-      robot.setJointImpedance({3000, 3000, 3000, 2500, 2500, 2000, 2000});
+      // Set joint impedance (stiffness): lower values for smoother motion
+      robot.setJointImpedance({1500, 1500, 1500, 1250, 1250, 1000, 1000});
     } catch (const franka::Exception& e) {
       std::cout << "Warning: Could not set impedance: " << e.what() << std::endl;
     }
@@ -198,6 +213,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\nWARNING: This example will move the robot! "
               << "Please make sure to have the user stop button at hand!" << std::endl
+              << "Also ensure the robot is activated (power button on teach pendant)." << std::endl
               << "Press Enter to continue..." << std::endl;
     std::cin.ignore();
     std::cin.ignore();
@@ -205,9 +221,11 @@ int main(int argc, char** argv) {
     // Move to target pose
     double time = 0.0;
     bool motion_finished = false;
+    double target_reached_time = -1.0;  // Time when target was first reached
+    constexpr double settling_time = 0.25;  // 0.25 second settling time after reaching target
     
     try {
-      robot.control([&time, &target_pose, movement_duration, &motion_finished](const franka::RobotState& robot_state,
+      robot.control([&time, &target_pose, movement_duration, &motion_finished, &target_reached_time](const franka::RobotState& robot_state,
                                           franka::Duration period) -> franka::CartesianPose {
         time += period.toSec();
         
@@ -268,7 +286,7 @@ int main(int argc, char** argv) {
         intermediate_pose[11] = 0.0;
         intermediate_pose[15] = 1.0;
 
-        // Check if robot has reached the target pose (within tolerance)
+        // Check if robot has reached the target pose
         double pos_error = 0.0;
         for (size_t i = 0; i < 3; i++) {
           double diff = robot_state.O_T_EE_c[12 + i] - target_pose[12 + i];
@@ -285,13 +303,18 @@ int main(int argc, char** argv) {
         );
         double rot_error = 1.0 - std::abs(actual_q.dot(target_q_final));
         
-        // Early exit if close enough to target (10mm position tolerance, relaxed rotation tolerance)
-        // Exit immediately once within tolerance to avoid long waits
-        if (pos_error < 0.010 && rot_error < 0.02) {
+        // Record when target is first reached (20mm position tolerance, past acceleration phase)
+        if (target_reached_time < 0.0 && pos_error < 0.020 && rot_error < 0.05 && time > accel_time) {
+          target_reached_time = time;
+        }
+
+        // Exit with settling time after reaching target, or at full duration
+        if (target_reached_time >= 0.0 && (time >= target_reached_time + settling_time)) {
+          std::cout << std::endl << "Target pose reached and settled" << std::endl;
           motion_finished = true;
           return franka::MotionFinished(target_pose);
         }
-
+        
         if (time >= movement_duration) {
           std::cout << std::endl << "Finished moving to target pose" << std::endl;
           motion_finished = true;
@@ -314,12 +337,27 @@ int main(int argc, char** argv) {
     }
 
   } catch (const franka::Exception& e) {
-    std::cerr << "Franka exception: " << e.what() << std::endl;
-    std::cerr << "Please check:" << std::endl;
-    std::cerr << "  - Robot is powered on" << std::endl;
-    std::cerr << "  - Robot is not in Reflex mode" << std::endl;
-    std::cerr << "  - Network connection is stable" << std::endl;
-    std::cerr << "  - Hostname/IP is correct" << std::endl;
+    std::string error_msg = e.what();
+    std::cerr << "Franka exception: " << error_msg << std::endl;
+    
+    // Provide specific guidance based on error type
+    if (error_msg.find("User stopped") != std::string::npos) {
+      std::cerr << "\nRobot is in 'User stopped' mode. Please:" << std::endl;
+      std::cerr << "  1. Check the teach pendant for any active stop buttons" << std::endl;
+      std::cerr << "  2. Press the power button on the teach pendant to activate the robot" << std::endl;
+      std::cerr << "  3. Ensure no emergency stop is active" << std::endl;
+    } else if (error_msg.find("Reflex") != std::string::npos) {
+      std::cerr << "\nRobot is in Reflex mode. Please:" << std::endl;
+      std::cerr << "  1. Exit Reflex mode on the robot's teach pendant or Desk" << std::endl;
+      std::cerr << "  2. Manually move the end effector away from obstacles" << std::endl;
+    } else {
+      std::cerr << "\nPlease check:" << std::endl;
+      std::cerr << "  - Robot is powered on and activated" << std::endl;
+      std::cerr << "  - Robot is not in Reflex or User stopped mode" << std::endl;
+      std::cerr << "  - Network connection is stable" << std::endl;
+      std::cerr << "  - Hostname/IP is correct" << std::endl;
+      std::cerr << "  - Target pose is reachable by the robot" << std::endl;
+    }
     return -1;
   } catch (const std::exception& e) {
     std::cerr << "Standard exception: " << e.what() << std::endl;
