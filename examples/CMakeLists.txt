@@ -22,6 +22,12 @@ add_library(examples_common STATIC
 
 target_link_libraries(examples_common PUBLIC Franka::Franka Eigen3::Eigen3)
 
+add_library(robot_pose_controller STATIC
+  robot_pose_controller.cpp
+)
+
+target_link_libraries(robot_pose_controller PUBLIC Franka::Franka examples_common Eigen3::Eigen3)
+
 set(EXAMPLES
   cartesian_impedance_control
   communication_test
@@ -46,6 +52,8 @@ foreach(example ${EXAMPLES})
   add_executable(${example} ${example}.cpp)
   target_link_libraries(${example} Franka::Franka examples_common Eigen3::Eigen3)
 endforeach()
+
+target_link_libraries(move_to_pose robot_pose_controller)
 
 target_link_libraries(joint_impedance_control Threads::Threads)
 target_link_libraries(motion_with_control Poco::Foundation)
